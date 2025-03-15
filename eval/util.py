@@ -106,8 +106,8 @@ def _recursive_generator(
     # Update progress counter.
     progress["count"] += 1
     # Log progress every 10 steps or when finished.
-    if progress["count"] % 10 == 0 or progress["count"] == total:
-      logger.info("GPU %s: Processed %d/%d interpolation steps", gpu_info, progress["count"], total)
+    # if progress["count"] % 10 == 0 or progress["count"] == total:
+    #   logger.info("GPU %s: Processed %d/%d interpolation steps", gpu_info, progress["count"], total)
     yield from _recursive_generator(frame1, mid_frame, num_recursions - 1,
                                     interpolator, total, progress, gpu_info)
     yield from _recursive_generator(mid_frame, frame2, num_recursions - 1,
