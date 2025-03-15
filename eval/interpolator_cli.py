@@ -1,4 +1,6 @@
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["PYTHONWARNINGS"] = "ignore"
 import math
 import glob
 import tensorflow as tf
@@ -134,7 +136,6 @@ def main(argv):
                                 block_height=FLAGS.block_height,
                                 block_width=FLAGS.block_width,
                                 output_frames_dir=output_frames_dir)
-    print("Video saved at:", video_path)
 
 if __name__ == '__main__':
     app.run(main)
