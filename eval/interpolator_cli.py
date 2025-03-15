@@ -24,7 +24,7 @@ flags.DEFINE_string('model_path', None,
 flags.DEFINE_integer('times_to_interpolate', 1,
                      'Number of recursive interpolations (output frames = 2^(times_to_interpolate) * (#pairs) + 1).')
 flags.DEFINE_integer('fps', 30, 'Frames per second for the output video.')
-flags.DEFINE_string('output_path', 'interpolated.mp4',
+flags.DEFINE_string('output_path', None,
                     'Output video file path.')
 flags.DEFINE_integer('align', 64, 'Alignment value to pad image dimensions.')
 flags.DEFINE_integer('block_height', 1,
@@ -110,8 +110,9 @@ def process_frames(frame_paths, times_to_interpolate, model_path, output_fps=30,
 
     if output_frames_dir is not None:
         _output_frames(final_frames, output_frames_dir)
-    media.write_video(FLAGS.output_path, final_frames, fps=output_fps)
-    absl_logging.info("Video saved at: %s", FLAGS.output_path)
+    if FLAGS.output_path is not None:
+      media.write_video(FLAGS.output_path, final_frames, fps=output_fps)
+      absl_logging.info("Video saved at: %s", FLAGS.output_path)
     return FLAGS.output_path
 
 def main(argv):
