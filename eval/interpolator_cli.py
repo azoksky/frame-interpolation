@@ -1,171 +1,136 @@
-import functools
 import os
-from typing import List, Sequence
-
-# Import internal modules
-from . import interpolator as interpolator_lib
-from . import util
-
-from absl import app
-from absl import flags
-from absl import logging
-# Removed: import apache_beam as beam (no longer used for multi-GPU inference)
-import mediapy as media
-import natsort
+import math
+import logging
 import numpy as np
+import mediapy as media
 import tensorflow as tf
+from absl import app, flags
 from tqdm.auto import tqdm
+from eval import interpolator as interpolator_lib, util
 
-# Control TensorFlow logging verbosity
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
-
-# Define command-line flags
+# Define command-line flags for inputs (pattern, model path, etc.)
 _PATTERN = flags.DEFINE_string(
-    name='pattern',
-    default=None,
-    required=True,
-    help='The glob pattern for directories with input frames.'
-)
+    'pattern', None,
+    'Glob pattern for directories with input frames (each directory is an independent task).',
+    required=True)
 _MODEL_PATH = flags.DEFINE_string(
-    name='model_path',
-    default=None,
-    help='Path of the TF2 SavedModel to use for frame interpolation.'
-)
-_TIMES_TO_INTERPOLATE = flags.DEFINE_integer(
-    name='times_to_interpolate',
-    default=5,
-    help=(
-        'Number of recursive midpoint interpolations. '
-        'Output frames = 2^times_to_interpolate + 1 (for two input frames).'
-    )
-)
+    'model_path', None,
+    'Path to the TF2 saved model to use for interpolation.', required=True)
+_TIMES = flags.DEFINE_integer(
+    'times_to_interpolate', 1,
+    'Number of recursive midpoint interpolations (output frames = 2^times + 1).')
 _FPS = flags.DEFINE_integer(
-    name='fps',
-    default=30,
-    help='Frame rate for the output video (if --output_video is True).'
-)
+    'fps', 30, 'Frames per second for the output video if generated.')
 _ALIGN = flags.DEFINE_integer(
-    name='align',
-    default=64,
-    help='If >1, pad input dimensions to be divisible by this value during inference.'
-)
-_BLOCK_HEIGHT = flags.DEFINE_integer(
-    name='block_height',
-    default=1,
-    help='Number of patches along the image height (for high-resolution splitting).'
-)
-_BLOCK_WIDTH = flags.DEFINE_integer(
-    name='block_width',
-    default=1,
-    help='Number of patches along the image width (for high-resolution splitting).'
-)
+    'align', 64, 'If >1, pad input size so it is divisible by this value (model requirement).')
+_BLOCK_H = flags.DEFINE_integer(
+    'block_height', 1, 'Number of patches along height for high-res images (1 = no tiling).')
+_BLOCK_W = flags.DEFINE_integer(
+    'block_width', 1, 'Number of patches along width for high-res images (1 = no tiling).')
 _OUTPUT_VIDEO = flags.DEFINE_boolean(
-    name='output_video',
-    default=False,
-    help='If true, save an MP4 video of the interpolated frames in each directory.'
-)
+    'output_video', False, 'If true, also save an MP4 video of the interpolated frames.')
 
-# Acceptable input image extensions
-_INPUT_EXT = ['png', 'jpg', 'jpeg']
-
-def _output_frames(frames: List[np.ndarray], frames_dir: str):
-    """Writes a list of RGB frames (numpy arrays) as PNG files to a directory."""
-    if tf.io.gfile.isdir(frames_dir):
-        # Remove any existing output frames in the directory
-        old_frames = tf.io.gfile.glob(f'{frames_dir}/frame_*.png')
-        if old_frames:
-            logging.info('Removing existing frames from %s.', frames_dir)
-            for old_frame in old_frames:
-                tf.io.gfile.remove(old_frame)
+# Utility to write frames to an output directory
+def _output_frames(frames: list[np.ndarray], out_dir: str):
+    if tf.io.gfile.isdir(out_dir):
+        # Remove old frames if any
+        for old_frame in tf.io.gfile.glob(f'{out_dir}/frame_*.png'):
+            tf.io.gfile.remove(old_frame)
     else:
-        tf.io.gfile.makedirs(frames_dir)
-    # Save each frame with a sequential filename
-    for idx, frame in tqdm(enumerate(frames), total=len(frames), ncols=100, colour='green'):
-        util.write_image(f'{frames_dir}/frame_{idx:03d}.png', frame)
-    logging.info('Output frames saved in %s.', frames_dir)
+        tf.io.gfile.makedirs(out_dir)
+    # Save each frame as PNG
+    for idx, frame in tqdm(enumerate(frames), total=len(frames), unit="frame"):
+        util.write_image(f'{out_dir}/frame_{idx:03d}.png', frame)
+    logging.info('Output frames saved in %s.', out_dir)
 
-def _run_inference():
-    """Runs frame interpolation on all directories matched by the pattern, using multi-GPU if available."""
-    # Find all directories matching the pattern
+def main(argv):
+    del argv  # Unused
+    # Prepare list of directories to process
     directories = tf.io.gfile.glob(_PATTERN.value)
     if not directories:
-        logging.error('No input directories found with pattern: %s', _PATTERN.value)
-        return
+        raise ValueError(f"No directories found for pattern {_PATTERN.value}")
 
-    # Determine if multiple GPUs are available
-    physical_gpus = tf.config.list_physical_devices('GPU')
-    num_gpus = len(physical_gpus)
-    if num_gpus > 1:
-        # Use MirroredStrategy for multi-GPU parallelism
-        strategy = tf.distribute.MirroredStrategy()
-        logging.info('Found %d GPUs. Using MirroredStrategy for parallel inference.', num_gpus)
+    # Enable memory growth for GPUs to allow multiple GPUs usage without conflicts
+    gpus = tf.config.list_physical_devices('GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+    num_gpus = len(gpus)
+    logging.info("Found %d GPUs for inference.", num_gpus)
+
+    # Load the interpolation model under distribution scope
+    strategy = tf.distribute.MirroredStrategy() if num_gpus > 1 else None
+    if strategy:
+        logging.info("Using MirroredStrategy with %d replicas.", strategy.num_replicas_in_sync)
+        with strategy.scope():
+            # Initialize the interpolator (this loads the model, e.g., from SavedModel)
+            interp = interpolator_lib.Interpolator(_MODEL_PATH.value, _ALIGN.value,
+                                                   [_BLOCK_H.value, _BLOCK_W.value])
     else:
-        # Use default strategy (single GPU or CPU)
-        strategy = tf.distribute.get_strategy()  # This will be a SingleDevice or default strategy
-        if num_gpus == 1:
-            logging.info('Found 1 GPU. Running on single GPU without MirroredStrategy.')
-        else:
-            logging.info('No GPU found. Running on CPU.')
+        # Single GPU/CPU: no strategy, just load normally
+        interp = interpolator_lib.Interpolator(_MODEL_PATH.value, _ALIGN.value,
+                                               [_BLOCK_H.value, _BLOCK_W.value])
 
-    # Create the interpolator model within the strategy scope (model gets replicated to each GPU)
-    with strategy.scope():
-        interpolator = interpolator_lib.Interpolator(
-            _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value]
-        )
-    logging.info('Loaded interpolation model from %s', _MODEL_PATH.value if _MODEL_PATH.value else "TFHub default")
-
-    # If video output is requested, configure ffmpeg for mediapy (do this once)
-    if _OUTPUT_VIDEO.value:
-        ffmpeg_path = util.get_ffmpeg_path()
-        media.set_ffmpeg(ffmpeg_path)
-
+    # Define a python function to process one directory (one task)
     def process_directory(dir_path: str):
-        """Process a single directory: read frames, interpolate, and save outputs."""
-        # Gather and sort input frame file paths (for all supported extensions)
+        if not dir_path:
+            # Empty path used for padding – do nothing
+            return 0
+        logging.info("Processing directory: %s", dir_path)
+        # Gather input frame file paths (supports png/jpg/jpeg)
         input_frames_lists = [
-            natsort.natsorted(tf.io.gfile.glob(f'{dir_path}/*.{ext}')) 
-            for ext in _INPUT_EXT
+            tf.io.gfile.glob(f'{dir_path}/*.{ext}') for ext in ['png', 'jpg', 'jpeg']
         ]
-        # Combine all found files into a single list
-        input_frames = functools.reduce(lambda x, y: x + y, input_frames_lists)
-        if not input_frames:
-            logging.warning('No images found in %s, skipping.', dir_path)
-            return
-        logging.info('Generating in-between frames for %s.', dir_path)
-        # Perform recursive interpolation to get intermediate frames
+        # Flatten and sort file list
+        input_frames = util.sort_files(input_frames_lists) if hasattr(util, "sort_files") else \
+                       sum(input_frames_lists, [])
+        input_frames = sorted(input_frames)  # ensure sorted order by name
+        if len(input_frames) < 2:
+            raise ValueError(f"Directory {dir_path} does not contain at least two frames.")
+        # Perform recursive interpolation on this sequence of frames
         frames = list(util.interpolate_recursively_from_files(
-            input_frames, _TIMES_TO_INTERPOLATE.value, interpolator
-        ))
+            input_frames, _TIMES.value, interp))
         # Save interpolated frames to disk
-        _output_frames(frames, f'{dir_path}/interpolated_frames')
-        # Optionally, save a video of the interpolated sequence
+        out_dir = os.path.join(dir_path, "interpolated_frames")
+        _output_frames(frames, out_dir)
+        # Optionally, save video
         if _OUTPUT_VIDEO.value:
-            output_video_path = f'{dir_path}/interpolated.mp4'
-            media.write_video(output_video_path, frames, fps=_FPS.value)
-            logging.info('Output video saved at %s.', output_video_path)
+            video_path = os.path.join(dir_path, "interpolated.mp4")
+            media.write_video(video_path, frames, fps=_FPS.value)
+            logging.info("Output video saved at %s.", video_path)
+        return 0  # return dummy result
 
-    if num_gpus > 1:
-        # Multi-GPU execution: distribute directories among GPUs in batches
-        batch_size = strategy.num_replicas_in_sync  # this should equal num_gpus
-        for i in range(0, len(directories), batch_size):
-            batch_dirs = directories[i : i + batch_size]
-            # Create distributed inputs for this batch: one directory path per replica
-            dist_dirs = strategy.experimental_distribute_values_from_function(
-                lambda ctx: batch_dirs[ctx.replica_id_in_sync_group] 
-                            if ctx.replica_id_in_sync_group < len(batch_dirs) else None
-            )
-            # Run processing in parallel on each GPU
-            strategy.run(lambda dir_path: process_directory(dir_path) 
-                         if dir_path is not None else None, args=(dist_dirs,))
+    if strategy:
+        # Create a tf.function to run distributed inference
+        @tf.function
+        def distributed_infer(per_replica_dirs):
+            # Each replica runs the processing function on its assigned directory
+            return strategy.run(lambda dir_path: tf.numpy_function(
+                    func=lambda p: process_directory(p.decode('utf-8')),
+                    inp=[dir_path], Tout=tf.int64),
+                args=(per_replica_dirs,))
+
+        # Process directories in batches of `num_gpus` for parallel execution
+        total_dirs = len(directories)
+        results = []
+        for i in range(0, total_dirs, strategy.num_replicas_in_sync):
+            batch_dirs = directories[i:i+strategy.num_replicas_in_sync]
+            # Pad batch to have exactly num_replicas elements (if needed)
+            if len(batch_dirs) < strategy.num_replicas_in_sync:
+                batch_dirs += [""] * (strategy.num_replicas_in_sync - len(batch_dirs))
+            # Create a per-replica value for the batch
+            batch_dirs_tensor = tf.convert_to_tensor(batch_dirs, dtype=tf.string)
+            per_replica_dirs = strategy.experimental_distribute_values_from_function(
+                lambda ctx: batch_dirs_tensor[ctx.replica_id_in_sync_group])
+            # Run distributed inference on this batch
+            distributed_infer(per_replica_dirs)
+            results.extend(batch_dirs[:len(batch_dirs)])  # record processed directories
+        logging.info("Processed %d directories with multi-GPU MirroredStrategy.", len(results))
     else:
-        # Single-device execution: loop through directories sequentially
-        for directory in directories:
-            process_directory(directory)
-
-def main(argv: Sequence[str]) -> None:
-    if len(argv) > 1:
-        raise app.UsageError("Too many command-line arguments.")
-    _run_inference()
+        # Single GPU/CPU: loop through directories sequentially
+        for d in directories:
+            process_directory(d)
+            logging.info("Processed directory: %s", d)
 
 if __name__ == '__main__':
     app.run(main)
