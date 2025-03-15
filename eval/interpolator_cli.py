@@ -7,7 +7,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from absl import app, flags, logging as absl_logging
 from eval import interpolator as interpolator_lib, util
-
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 # Configure logging.
 absl_logging.set_verbosity(absl_logging.INFO)
 
