@@ -1,11 +1,11 @@
 # Copyright 2022 Google LLC
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utility functions for frame interpolation on a set of video frames."""
+
 import os
 import shutil
 from typing import Generator, Iterable, List, Optional
@@ -20,7 +21,16 @@ from typing import Generator, Iterable, List, Optional
 from . import interpolator as interpolator_lib
 import numpy as np
 import tensorflow as tf
-from tqdm import tqdm
+import logging
+
+# Set up a logger for this module.
+logger = logging.getLogger("frame_interpolation.util")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 _UINT8_MAX_F = float(np.iinfo(np.uint8).max)
 _CONFIG_FFMPEG_NAME_OR_PATH = 'ffmpeg'
@@ -60,9 +70,13 @@ def write_image(filename: str, image: np.ndarray) -> None:
 
 
 def _recursive_generator(
-    frame1: np.ndarray, frame2: np.ndarray, num_recursions: int,
+    frame1: np.ndarray,
+    frame2: np.ndarray,
+    num_recursions: int,
     interpolator: interpolator_lib.Interpolator,
-    bar: Optional[tqdm] = None
+    total: int,
+    progress: dict,
+    gpu_info: str
 ) -> Generator[np.ndarray, None, None]:
   """Splits halfway to repeatedly generate more frames.
 
@@ -71,6 +85,9 @@ def _recursive_generator(
     frame2: Input image 2.
     num_recursions: How many times to interpolate the consecutive image pairs.
     interpolator: The frame interpolator instance.
+    total: Total expected progress count.
+    progress: A dict containing a mutable progress counter, e.g. {"count": 0}.
+    gpu_info: A string indicating GPU info (e.g. '/device:GPU:0').
 
   Yields:
     The interpolated frames, including the first frame (frame1), but excluding
@@ -79,21 +96,29 @@ def _recursive_generator(
   if num_recursions == 0:
     yield frame1
   else:
-    # Adds the batch dimension to all inputs before calling the interpolator,
-    # and remove it afterwards.
+    # Prepare time input for midpoint interpolation.
     time = np.full(shape=(1,), fill_value=0.5, dtype=np.float32)
-    mid_frame = interpolator(frame1[np.newaxis, ...], frame2[np.newaxis, ...],
-                             time)[0]
-    bar.update(1) if bar is not None else bar
+    mid_frame = interpolator(
+        frame1[np.newaxis, ...],
+        frame2[np.newaxis, ...],
+        time
+    )[0]
+    # Update progress counter.
+    progress["count"] += 1
+    # Log progress every 10 steps or when finished.
+    if progress["count"] % 10 == 0 or progress["count"] == total:
+      logger.info("GPU %s: Processed %d/%d interpolation steps", gpu_info, progress["count"], total)
     yield from _recursive_generator(frame1, mid_frame, num_recursions - 1,
-                                    interpolator, bar)
+                                    interpolator, total, progress, gpu_info)
     yield from _recursive_generator(mid_frame, frame2, num_recursions - 1,
-                                    interpolator, bar)
+                                    interpolator, total, progress, gpu_info)
 
 
 def interpolate_recursively_from_files(
-    frames: List[str], times_to_interpolate: int,
-    interpolator: interpolator_lib.Interpolator) -> Iterable[np.ndarray]:
+    frames: List[str],
+    times_to_interpolate: int,
+    interpolator: interpolator_lib.Interpolator
+) -> Iterable[np.ndarray]:
   """Generates interpolated frames by repeatedly interpolating the midpoint.
 
   Loads the files on demand and uses the yield paradigm to return the frames
@@ -104,52 +129,62 @@ def interpolate_recursively_from_files(
 
   Args:
     frames: List of input frames. Expected shape (H, W, 3). The colors should be
-      in the range[0, 1] and in gamma space.
-    times_to_interpolate: Number of times to do recursive midpoint
-      interpolation.
+      in the range [0, 1] and in gamma space.
+    times_to_interpolate: Number of times to do recursive midpoint interpolation.
     interpolator: The frame interpolation model to use.
 
   Yields:
     The interpolated frames (including the inputs).
   """
   n = len(frames)
-  num_frames = (n - 1) * (2**(times_to_interpolate) - 1)
-  bar = tqdm(total=num_frames, ncols=100, colour='green')
+  total = (n - 1) * (2**times_to_interpolate - 1)
+  # Obtain GPU device name if available.
+  gpu_info = tf.test.gpu_device_name() or "CPU"
+  logger.info("Starting recursive interpolation on GPU: %s with total steps: %d", gpu_info, total)
+  # Create a mutable progress counter.
+  progress = {"count": 0}
   for i in range(1, n):
     yield from _recursive_generator(
-        read_image(frames[i - 1]), read_image(frames[i]), times_to_interpolate,
-        interpolator, bar)
+        read_image(frames[i - 1]),
+        read_image(frames[i]),
+        times_to_interpolate,
+        interpolator,
+        total,
+        progress,
+        gpu_info
+    )
   # Separately yield the final frame.
   yield read_image(frames[-1])
 
+
 def interpolate_recursively_from_memory(
-    frames: List[np.ndarray], times_to_interpolate: int,
-    interpolator: interpolator_lib.Interpolator) -> Iterable[np.ndarray]:
+    frames: List[np.ndarray],
+    times_to_interpolate: int,
+    interpolator: interpolator_lib.Interpolator
+) -> Iterable[np.ndarray]:
   """Generates interpolated frames by repeatedly interpolating the midpoint.
 
   This is functionally equivalent to interpolate_recursively_from_files(), but
-  expects the inputs frames in memory, instead of loading them on demand.
-
-  Recursive interpolation is useful if the interpolator is trained to predict
-  frames at midpoint only and is thus expected to perform poorly elsewhere.
+  expects the input frames in memory, instead of loading them on demand.
 
   Args:
     frames: List of input frames. Expected shape (H, W, 3). The colors should be
-      in the range[0, 1] and in gamma space.
-    times_to_interpolate: Number of times to do recursive midpoint
-      interpolation.
+      in the range [0, 1] and in gamma space.
+    times_to_interpolate: Number of times to do recursive midpoint interpolation.
     interpolator: The frame interpolation model to use.
 
   Yields:
     The interpolated frames (including the inputs).
   """
   n = len(frames)
-  num_frames = (n - 1) * (2**(times_to_interpolate) - 1)
-  bar = tqdm(total=num_frames, ncols=100, colour='green')
+  total = (n - 1) * (2**times_to_interpolate - 1)
+  gpu_info = tf.test.gpu_device_name() or "CPU"
+  logger.info("Starting recursive interpolation on GPU: %s with total steps: %d", gpu_info, total)
+  progress = {"count": 0}
   for i in range(1, n):
     yield from _recursive_generator(frames[i - 1], frames[i],
-                                    times_to_interpolate, interpolator, bar)
-  # Separately yield the final frame.
+                                    times_to_interpolate, interpolator,
+                                    total, progress, gpu_info)
   yield frames[-1]
 
 
@@ -157,6 +192,6 @@ def get_ffmpeg_path() -> str:
   path = shutil.which(_CONFIG_FFMPEG_NAME_OR_PATH)
   if not path:
     raise RuntimeError(
-        f"Program '{_CONFIG_FFMPEG_NAME_OR_PATH}' is not found;"
-        " perhaps install ffmpeg using 'apt-get install ffmpeg'.")
+        f"Program '{_CONFIG_FFMPEG_NAME_OR_PATH}' is not found; "
+        "perhaps install ffmpeg using 'apt-get install ffmpeg'.")
   return path
