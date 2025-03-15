@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from absl import app, flags, logging as absl_logging
 from eval import interpolator as interpolator_lib, util
 
-# Configure logging to print to stdout.
+# Configure logging.
 absl_logging.set_verbosity(absl_logging.INFO)
 
 FLAGS = flags.FLAGS
@@ -43,12 +43,30 @@ def get_frame_files(input_pattern: str):
     else:
         return sorted(glob.glob(input_pattern))
 
+def _output_frames(frames: list, out_dir: str):
+    """
+    Saves the given frames (as numpy arrays) into out_dir.
+    Each frame is written as a PNG file named frame_000.png, frame_001.png, etc.
+    """
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    else:
+        # Optionally, remove existing files
+        for f in glob.glob(os.path.join(out_dir, "frame_*.png")):
+            os.remove(f)
+    for idx, frame in enumerate(frames):
+        filename = os.path.join(out_dir, f"frame_{idx:03d}.png")
+        util.write_image(filename, frame)
+    absl_logging.info("Interpolated frames saved to: %s", out_dir)
+
 def process_frames(frame_paths, times_to_interpolate, model_path, output_fps=30,
-                   align=64, block_height=1, block_width=1) -> str:
+                   align=64, block_height=1, block_width=1, output_frames_dir=None) -> str:
     """
     Interpolates between frames using manual GPU assignment.
-    Splits the input frames into segments, processes each segment on a separate GPU,
-    then merges the results into a single video.
+    Splits the input frames into segments (with one-frame overlap),
+    processes each segment on a separate GPU, then merges the results.
+    The individual frames are saved to output_frames_dir,
+    and a video is generated as specified by FLAGS.output_path.
     """
     if len(frame_paths) < 2:
         raise ValueError("Need at least two frames to interpolate.")
@@ -67,6 +85,8 @@ def process_frames(frame_paths, times_to_interpolate, model_path, output_fps=30,
         absl_logging.info("Using single-GPU mode")
         interpolator = interpolator_lib.Interpolator(model_path, align, [block_height, block_width])
         frames = list(util.interpolate_recursively_from_files(frame_paths, times_to_interpolate, interpolator))
+        if output_frames_dir is not None:
+            _output_frames(frames, output_frames_dir)
         media.write_video(FLAGS.output_path, frames, fps=output_fps)
         return FLAGS.output_path
 
@@ -81,7 +101,7 @@ def process_frames(frame_paths, times_to_interpolate, model_path, output_fps=30,
         seg = frame_paths[start:end + 1]
         segments.append(seg)
     
-    # Ensure overlap between segments: make first frame of each segment same as last of previous.
+    # Ensure overlap between segments: first frame of each segment equals last frame of previous.
     for j in range(1, len(segments)):
         segments[j][0] = segments[j-1][-1]
     
@@ -94,7 +114,6 @@ def process_frames(frame_paths, times_to_interpolate, model_path, output_fps=30,
         with tf.device(f'/GPU:{gpu_index}'):
             interpolators.append(interpolator_lib.Interpolator(model_path, align, [block_height, block_width]))
     
-    # Worker function for each GPU segment with logging.
     def process_segment(idx: int) -> list:
         try:
             absl_logging.info("GPU %d: Starting segment %d with %d frames.",
@@ -110,7 +129,6 @@ def process_frames(frame_paths, times_to_interpolate, model_path, output_fps=30,
             absl_logging.error("GPU %d: Exception in segment %d: %s", idx, idx, str(e))
             raise
 
-    # Execute segment processing in parallel.
     results = [None] * len(segments)
     with ThreadPoolExecutor(max_workers=len(segments)) as executor:
         future_to_idx = {executor.submit(process_segment, idx): idx for idx in range(len(segments))}
@@ -122,10 +140,13 @@ def process_frames(frame_paths, times_to_interpolate, model_path, output_fps=30,
                 absl_logging.error("Segment %d generated an exception: %s", idx, exc)
                 raise
 
-    # Merge segments, removing duplicate overlap frames.
     final_frames = results[0]
     for seg in results[1:]:
         final_frames.extend(seg[1:])  # drop the first frame (overlap)
+    
+    # Save the individual interpolated frames.
+    if output_frames_dir is not None:
+        _output_frames(final_frames, output_frames_dir)
     
     media.write_video(FLAGS.output_path, final_frames, fps=output_fps)
     absl_logging.info("Video saved at: %s", FLAGS.output_path)
@@ -133,10 +154,21 @@ def process_frames(frame_paths, times_to_interpolate, model_path, output_fps=30,
 
 def main(argv):
     del argv  # Unused.
+    # Get frame file list.
     frame_files = get_frame_files(FLAGS.input_pattern)
     if not frame_files:
         raise ValueError("No frame files found for pattern: " + FLAGS.input_pattern)
     absl_logging.info("Found %d frame files.", len(frame_files))
+    
+    # Determine the directory to save interpolated frames.
+    # If the input pattern is a directory, create an "interpolated" subfolder.
+    if os.path.isdir(FLAGS.input_pattern):
+        output_frames_dir = os.path.join(FLAGS.input_pattern, "interpolated")
+    else:
+        # Otherwise, use the directory of the glob pattern.
+        output_frames_dir = os.path.join(os.path.dirname(FLAGS.input_pattern), "interpolated")
+    
+    absl_logging.info("Interpolated frames will be saved in: %s", output_frames_dir)
     
     video_path = process_frames(frame_files,
                                 times_to_interpolate=FLAGS.times_to_interpolate,
@@ -144,7 +176,8 @@ def main(argv):
                                 output_fps=FLAGS.fps,
                                 align=FLAGS.align,
                                 block_height=FLAGS.block_height,
-                                block_width=FLAGS.block_width)
+                                block_width=FLAGS.block_width,
+                                output_frames_dir=output_frames_dir)
     print("Video saved at:", video_path)
 
 if __name__ == '__main__':
