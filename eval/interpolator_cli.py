@@ -1,4 +1,5 @@
 import functools
+import math
 import os
 import shutil
 from typing import List, Sequence
@@ -97,21 +98,16 @@ def _process_directory(directory: str):
     num_gpus = len(physical_gpus)
 
     if num_gpus >= 2:
-        # For multi-GPU, split the input frames into two segments.
-        if num_input_frames % 2 == 0:
-            segment1 = input_frames[: num_input_frames // 2 + 1]
-            segment2 = input_frames[num_input_frames // 2:]
-        else:
-            segment1 = input_frames[: (num_input_frames // 2) + 1]
-            segment2 = input_frames[(num_input_frames // 2):]
+        # Equal split: for even frames, split equally; for odd, assign the extra frame to GPU0.
+        split_index = math.ceil(num_input_frames / 2)
+        segment1 = input_frames[:split_index]
+        segment2 = input_frames[split_index:]
         logging.info("Total %d frames split as follows: Segment 1: %d frames, Segment 2: %d frames.",
                      num_input_frames, len(segment1), len(segment2))
-        segments = [segment1, segment2]
         threads = []
         results = [None, None]
 
         def interpolate_segment(seg_frames: List[str], gpu_index: int):
-            # Use a valid device string.
             device_str = f'/GPU:{gpu_index}'
             first_frame = os.path.basename(seg_frames[0])
             last_frame = os.path.basename(seg_frames[-1])
@@ -119,12 +115,10 @@ def _process_directory(directory: str):
             with tf.device(device_str):
                 interpolator = interpolator_lib.Interpolator(
                     _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
-                # Calculate total interpolation steps for this segment.
                 num_pairs = len(seg_frames) - 1
                 total_steps = num_pairs * (2 ** times - 1)
                 progress = {"count": 0}
                 seg_result = []
-                # Create a shared progress bar for this segment.
                 with tqdm(total=total_steps, desc=f"GPU {gpu_index} Interpolation", ncols=100) as pbar:
                     for i in range(1, len(seg_frames)):
                         pair_frames = list(util._recursive_generator(
@@ -132,32 +126,46 @@ def _process_directory(directory: str):
                             util.read_image(seg_frames[i]),
                             times, interpolator, total_steps, progress, device_str,
                             pbar=pbar))
-                        # Append all but the last frame to avoid duplicate at boundaries.
+                        # Append all but the last frame.
                         seg_result.extend(pair_frames[:-1])
-                    # Append the final frame of the segment.
                     seg_result.append(util.read_image(seg_frames[-1]))
             results[gpu_index] = seg_result
             logging.info("GPU %d finished processing frames %s through %s", gpu_index, first_frame, last_frame)
 
-        for gpu_idx in range(2):
-            t = threading.Thread(target=interpolate_segment, args=(segments[gpu_idx], gpu_idx))
+        # Start threads for each segment.
+        for gpu_idx, seg in enumerate([segment1, segment2]):
+            t = threading.Thread(target=interpolate_segment, args=(seg, gpu_idx))
             t.start()
             threads.append(t)
         for t in threads:
             t.join()
-        # Merge segments: drop the duplicate overlapping frame.
-        combined_frames = results[0] + results[1][1:]
+
+        # Process the boundary pair (last frame of segment1 and first frame of segment2).
+        logging.info("Processing boundary interpolation between frame %s and %s",
+                     os.path.basename(segment1[-1]), os.path.basename(segment2[0]))
+        with tf.device('/GPU:0'):
+            interpolator = interpolator_lib.Interpolator(
+                _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
+            total_steps = 2 ** times - 1
+            progress = {"count": 0}
+            with tqdm(total=total_steps, desc="Boundary Interpolation", ncols=100) as pbar:
+                boundary_frames = list(util._recursive_generator(
+                    util.read_image(segment1[-1]),
+                    util.read_image(segment2[0]),
+                    times, interpolator, total_steps, progress, '/GPU:0',
+                    pbar=pbar))
+        # Merge segments by removing the duplicate boundary frame from GPU0's result and inserting the boundary interpolation.
+        combined_frames = results[0][:-1] + boundary_frames + results[1]
+
     else:
         # Single GPU or CPU: process sequentially.
         logging.info("Using single GPU/CPU for processing.")
         with tf.device('/GPU:0' if num_gpus == 1 else '/CPU:0'):
             interpolator = interpolator_lib.Interpolator(
                 _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
-            # Calculate total steps for progress bar.
             num_pairs = len(input_frames) - 1
             total_steps = num_pairs * (2 ** times - 1)
             progress = {"count": 0}
-            # Create a shared progress bar.
             pbar = tqdm(total=total_steps, desc="Interpolation progress", ncols=100)
             combined_frames = list(util._recursive_generator_chain(
                 input_frames, times, interpolator, total_steps, progress, pbar))
@@ -175,7 +183,6 @@ def _process_directory(directory: str):
 
 def main(argv: Sequence[str]) -> None:
     del argv
-    # Redirect logging so that tqdm progress bars remain intact.
     with logging_redirect_tqdm():
         directories = tf.io.gfile.glob(_PATTERN.value)
         if not directories:
