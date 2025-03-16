@@ -11,7 +11,15 @@ import natsort
 import numpy as np
 import tensorflow as tf
 from tqdm.auto import tqdm
-from tqdm.contrib.logging import logging_redirect_tqdm
+
+# Fallback for logging_redirect_tqdm in case it's not available.
+try:
+    from tqdm.contrib.logging import logging_redirect_tqdm
+except ImportError:
+    from contextlib import contextmanager
+    @contextmanager
+    def logging_redirect_tqdm():
+        yield
 
 # Set TensorFlow log level.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -116,7 +124,6 @@ def _process_directory(directory: str):
                 total_steps = num_pairs * (2 ** times - 1)
                 progress = {"count": 0}
                 seg_result = []
-                # Process each adjacent pair.
                 # Create a shared progress bar for this segment.
                 with tqdm(total=total_steps, desc=f"GPU {gpu_index} Interpolation", ncols=100) as pbar:
                     for i in range(1, len(seg_frames)):
