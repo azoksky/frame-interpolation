@@ -9,9 +9,21 @@ import numpy as np
 import tensorflow as tf
 import logging
 from tqdm.auto import tqdm
-from tqdm.contrib.logging import TqdmLoggingHandler
 
-# Set up logger with tqdm logging handler.
+# Fallback for TqdmLoggingHandler in case it's not available.
+try:
+    from tqdm.contrib.logging import TqdmLoggingHandler
+except ImportError:
+    class TqdmLoggingHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                tqdm.write(msg)
+                self.flush()
+            except Exception:
+                self.handleError(record)
+
+# Set up logger with the (fallback) tqdm logging handler.
 logger = logging.getLogger("frame_interpolation.util")
 if not logger.handlers:
     handler = TqdmLoggingHandler()
@@ -126,3 +138,37 @@ def interpolate_recursively_from_files(
                 device,
                 pbar=pbar
             )
+        yield read_image(frames[-1])
+
+def interpolate_recursively_from_memory(
+    frames: List[np.ndarray],
+    times_to_interpolate: int,
+    interpolator: interpolator_lib.Interpolator
+) -> Iterable[np.ndarray]:
+    """Generates interpolated frames from in-memory images with a graphical progress bar."""
+    n = len(frames)
+    total = (n - 1) * (2 ** times_to_interpolate - 1)
+    device = get_valid_device()
+    logger.info("Starting recursive interpolation on %s with total steps: %d", device, total)
+    progress = {"count": 0}
+    with tqdm(total=total, desc="Interpolation progress", ncols=100) as pbar:
+        for i in range(1, n):
+            yield from _recursive_generator(
+                frames[i - 1],
+                frames[i],
+                times_to_interpolate,
+                interpolator,
+                total,
+                progress,
+                device,
+                pbar=pbar
+            )
+        yield frames[-1]
+
+def get_ffmpeg_path() -> str:
+    path = shutil.which(_CONFIG_FFMPEG_NAME_OR_PATH)
+    if not path:
+        raise RuntimeError(
+            f"Program '{_CONFIG_FFMPEG_NAME_OR_PATH}' not found; please install ffmpeg."
+        )
+    return path
