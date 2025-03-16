@@ -13,7 +13,7 @@ import numpy as np
 import tensorflow as tf
 from tqdm.auto import tqdm
 
-# Fallback for logging_redirect_tqdm in case it's not available.
+# Fallback for logging_redirect_tqdm.
 try:
     from tqdm.contrib.logging import logging_redirect_tqdm
 except ImportError:
@@ -22,7 +22,6 @@ except ImportError:
     def logging_redirect_tqdm():
         yield
 
-# Set TensorFlow log level.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 # Command-line flags.
@@ -40,7 +39,6 @@ _TIMES_TO_INTERPOLATE = flags.DEFINE_integer(
     name='times_to_interpolate',
     default=5,
     help='Number of recursive midpoint interpolations to perform.')
-# Unused FPS flag (video generation removed)
 _FPS = flags.DEFINE_integer(
     name='fps',
     default=30,
@@ -58,7 +56,6 @@ _BLOCK_WIDTH = flags.DEFINE_integer(
     default=1,
     help='Number of patches along width (1 means no tiling).')
 
-# Allowed file extensions.
 _INPUT_EXT = ['png', 'jpg', 'jpeg']
 
 def _output_frames(frames: List[np.ndarray], frames_dir: str):
@@ -77,17 +74,11 @@ def _output_frames(frames: List[np.ndarray], frames_dir: str):
     logging.info('Output frames saved in %s.', frames_dir)
 
 def _process_directory(directory: str):
-    """Process one directory by distributing adjacent pair interpolation across GPUs.
+    """Distributes adjacent-pair interpolation across GPUs using one shared progress bar.
     
-    The total number of output frames is (n-1)*(2^T-1) + 1, where T is the
-    number of interpolation recursions and n is the number of input frames.
-    
-    We split the n-1 adjacent pairs into two contiguous blocks:
-      - GPU0 processes pairs 0..m-1 (input frames 0..m)
-      - GPU1 processes pairs m..(n-2) (input frames m..n-1)
-    and then merge the results, dropping the duplicate boundary frame.
+    The input frames are split into two segments (non-overlapping) for the GPUs.
+    After interpolation, the segments are merged (dropping the duplicate boundary frame).
     """
-    # Gather input frame file paths.
     input_frames_list = [
         natsort.natsorted(tf.io.gfile.glob(f'{directory}/*.{ext}'))
         for ext in _INPUT_EXT
@@ -100,17 +91,22 @@ def _process_directory(directory: str):
 
     logging.info('Generating in-between frames for %s.', directory)
     times = _TIMES_TO_INTERPOLATE.value
-    total_pairs = n - 1  # each adjacent pair is a work unit
+    total_pairs = n - 1
+    global_total_steps = total_pairs * (2 ** times - 1)
 
-    # Split adjacent pairs nearly equally.
-    m = total_pairs // 2  # GPU0 processes pairs 0..m-1; GPU1 processes pairs m..total_pairs-1
-    # Note: GPU0’s segment will use frames[0...m] and GPU1’s segment will use frames[m...n-1].
+    # Split adjacent pairs nearly equally:
+    # GPU0 processes pairs corresponding to frames[0...m] and GPU1 processes frames[m...n-1].
+    m = total_pairs // 2
     logging.info("Total input frames: %d (i.e., %d pairs). GPU0 gets pairs 0..%d, GPU1 gets pairs %d..%d.",
                  n, total_pairs, m, m, total_pairs - 1)
 
-    results = [None, None]  # to store each GPU's interpolated segment
+    results = [None, None]
 
-    def process_segment(frames_subset: List[str], gpu_id: int, segment_name: str):
+    # Create one shared progress bar with blue description.
+    shared_pbar = tqdm(total=global_total_steps,
+                       desc="\033[94mOverall Interpolation\033[0m", ncols=100)
+
+    def process_segment(frames_subset: List[str], gpu_id: int, segment_name: str, seg_total_steps: int):
         device_str = f'/GPU:{gpu_id}'
         first_frame = os.path.basename(frames_subset[0])
         last_frame = os.path.basename(frames_subset[-1])
@@ -118,43 +114,42 @@ def _process_directory(directory: str):
         with tf.device(device_str):
             interpolator = interpolator_lib.Interpolator(
                 _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
-            # Use the existing helper to process adjacent pairs in the given subset.
-            # This function processes all pairs and returns a continuous output sequence.
-            seg_result = list(util.interpolate_recursively_from_files(frames_subset, times, interpolator))
+            progress = {"count": 0}
+            seg_result = list(util._recursive_generator_chain(frames_subset, times, interpolator, seg_total_steps, progress, shared_pbar))
         results[gpu_id] = seg_result
         logging.info("GPU %d finished processing %s.", gpu_id, segment_name)
 
     threads = []
 
-    # GPU0: process frames[0...m] (i.e. pairs 0 to m-1)
+    # GPU0: process frames[0...m] (m pairs).
     gpu0_frames = input_frames[:m+1]
-    t0 = threading.Thread(target=process_segment, args=(gpu0_frames, 0, "Segment GPU0"))
+    seg0_steps = m * (2 ** times - 1)
+    t0 = threading.Thread(target=process_segment, args=(gpu0_frames, 0, "Segment GPU0", seg0_steps))
     t0.start()
     threads.append(t0)
 
-    # GPU1: process frames[m...n-1] (i.e. pairs m to n-2)
+    # GPU1: process frames[m...n-1] ((total_pairs - m) pairs).
     gpu1_frames = input_frames[m:]
-    t1 = threading.Thread(target=process_segment, args=(gpu1_frames, 1, "Segment GPU1"))
+    seg1_steps = (total_pairs - m) * (2 ** times - 1)
+    t1 = threading.Thread(target=process_segment, args=(gpu1_frames, 1, "Segment GPU1", seg1_steps))
     t1.start()
     threads.append(t1)
 
     for t in threads:
         t.join()
 
-    # Merge the results:
-    # GPU0’s output ends with the frame at index m, which is the same as GPU1’s first frame.
-    # So we drop the first frame of GPU1’s output.
-    combined_frames = results[0] + results[1][1:]
-    logging.info("Total output frames: %d (expected: %d)", len(combined_frames),
-                 (n - 1) * (2 ** times - 1) + 1)
+    shared_pbar.close()
 
-    # Save and zip output frames.
-    output_dir = os.path.join(directory, "interpolated_frames")
-    _output_frames(combined_frames, output_dir)
+    # Merge the two segments; drop the duplicate boundary frame.
+    combined_frames = results[0] + results[1][1:]
+    expected_total_frames = (n - 1) * (2 ** times - 1) + 1
+    logging.info("Total output frames: %d (expected: %d)", len(combined_frames), expected_total_frames)
+
+    _output_frames(combined_frames, os.path.join(directory, "interpolated_frames"))
     zip_path = os.path.join(directory, "interpolated_frames.zip")
     if tf.io.gfile.exists(zip_path):
         tf.io.gfile.remove(zip_path)
-    shutil.make_archive(os.path.join(directory, "interpolated_frames"), 'zip', root_dir=output_dir)
+    shutil.make_archive(os.path.join(directory, "interpolated_frames"), 'zip', root_dir=os.path.join(directory, "interpolated_frames"))
     logging.info('Interpolated frames have been zipped at %s.', zip_path)
 
 def main(argv: Sequence[str]) -> None:
