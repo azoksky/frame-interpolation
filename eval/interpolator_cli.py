@@ -1,5 +1,6 @@
 import functools
 import os
+import shutil
 from typing import List, Sequence
 import threading  # Added for multi-GPU threading
 
