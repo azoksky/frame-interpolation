@@ -17,11 +17,11 @@ from tqdm.auto import tqdm
 # Control TensorFlow C++ logging.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
 
-# Define flags.
+# Flags (video-related flags have been removed).
 _PATTERN = flags.DEFINE_string(
     name='pattern',
     default=None,
-    help='The glob pattern to find directories with input frames.',
+    help='Glob pattern to find directories containing input frames.',
     required=True)
 _MODEL_PATH = flags.DEFINE_string(
     name='model_path',
@@ -30,77 +30,72 @@ _MODEL_PATH = flags.DEFINE_string(
 _TIMES_TO_INTERPOLATE = flags.DEFINE_integer(
     name='times_to_interpolate',
     default=5,
-    help='The number of times to run recursive midpoint interpolation. '
-         'For each pair, the number of output frames is (2^times_to_interpolate - 1) + 1.')
-_FPS = flags.DEFINE_integer(
-    name='fps',
-    default=30,
-    help='(Unused now; video generation is removed).')
+    help='The number of times to do recursive midpoint interpolation.')
 _ALIGN = flags.DEFINE_integer(
     name='align',
     default=1,
-    help='If >1, pad the input so that its dimensions are evenly divisible by this value.')
+    help='Pad the input so its dimensions are divisible by this value.')
 _BLOCK_HEIGHT = flags.DEFINE_integer(
     name='block_height',
     default=1,
-    help='Number of patches along the image height.')
+    help='Number of patches along height.')
 _BLOCK_WIDTH = flags.DEFINE_integer(
     name='block_width',
     default=1,
-    help='Number of patches along the image width.')
-_INPUT_EXT = flags.DEFINE_list(
-    name='input_ext',
-    default=['png', 'jpg', 'jpeg'],
-    help='List of allowed input image file extensions.')
+    help='Number of patches along width.')
 
 def _process_directory(directory: str):
-    """For a given directory of images, run frame interpolation and zip the result."""
-    # Gather input frame file paths (all allowed extensions) in sorted order.
+    """Processes one directory of frames: interpolates and saves the result."""
+    # Gather input frame file paths (allowed extensions: png, jpg, jpeg) in sorted order.
     input_frames_list = [
         natsort.natsorted(tf.io.gfile.glob(f'{directory}/*.{ext}'))
-        for ext in _INPUT_EXT.value
+        for ext in ['png', 'jpg', 'jpeg']
     ]
+    # Flatten the list of lists.
     input_frames = functools.reduce(lambda x, y: x + y, input_frames_list)
     if len(input_frames) < 2:
         logging.error('Not enough frames in %s to interpolate.', directory)
         return
 
     logging.info('Generating in-between frames for directory: %s', directory)
-    times = _TIMES_TO_INTERPOLATE.value
     N = len(input_frames)
     logging.info('Total input frames: %d', N)
 
     physical_gpus = tf.config.list_physical_devices('GPU')
     if len(physical_gpus) < 2:
         logging.info('Less than 2 GPUs found; using single GPU processing.')
-        interp_instance = interpolator_lib.Interpolator(
-            _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
-        combined_frames = list(util.interpolate_recursively_from_files(
-            input_frames, times, interp_instance))
+        device = physical_gpus[0].name if physical_gpus else '/CPU:0'
+        with tf.device(device):
+            interp_instance = interpolator_lib.Interpolator(
+                _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
+            combined_frames = list(util.interpolate_recursively_from_files(
+                input_frames, _TIMES_TO_INTERPOLATE.value, interp_instance))
     else:
-        # Split the list into two non-overlapping segments.
-        # For even number, both segments have equal length.
-        # For odd, first segment gets one extra frame.
-        split_index = (N + 1) // 2
-        segment0 = input_frames[0:split_index]
-        segment1 = input_frames[split_index:]
-        logging.info('Segment split: segment0 has %d frames; segment1 has %d frames.',
+        # There are N-1 frame pairs.
+        num_pairs = N - 1
+        tasks_gpu0 = num_pairs // 2 + (num_pairs % 2)  # GPU0 gets extra pair if odd.
+        # GPU0 processes frames[0:tasks_gpu0+1]; GPU1 processes frames[tasks_gpu0:].
+        segment0 = input_frames[0 : tasks_gpu0 + 1]
+        segment1 = input_frames[tasks_gpu0 :]
+        logging.info('Segment split: GPU0 will process %d frames; GPU1 will process %d frames.',
                      len(segment0), len(segment1))
         results = [None, None]
         threads = []
 
-        def process_segment(segment_frames, gpu_index, result_index):
+        def process_segment(segment_frames: List[str], gpu_index: int, result_index: int):
             gpu_info = f'/GPU:{gpu_index}'
             with tf.device(gpu_info):
                 interp_inst = interpolator_lib.Interpolator(
                     _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
-                if len(segment_frames) < 2:
-                    # If only one frame, just load it.
-                    res = [util.read_image(segment_frames[0])]
-                else:
-                    res = list(util.interpolate_recursively_from_files(
-                        segment_frames, times, interp_inst, gpu_info=gpu_info))
-                results[result_index] = res
+                total_steps = (len(segment_frames) - 1) * (2**_TIMES_TO_INTERPOLATE.value - 1)
+                pbar = tqdm(total=total_steps, desc=f"GPU {gpu_info}", ncols=100, colour='green')
+                seg_result = []
+                for frame in util.interpolate_recursively_from_files(segment_frames, _TIMES_TO_INTERPOLATE.value, interp_inst, gpu_info=gpu_info):
+                    seg_result.append(frame)
+                    pbar.update(1)
+                pbar.close()
+                results[result_index] = seg_result
+                logging.info("GPU %d finished processing segment; generated %d frames.", gpu_index, len(seg_result))
 
         t0 = threading.Thread(target=process_segment, args=(segment0, 0, 0))
         t0.start()
@@ -113,31 +108,15 @@ def _process_directory(directory: str):
             results[1] = []
         for t in threads:
             t.join()
-
-        # Compute boundary interpolation for the pair (last frame of segment0, first frame of segment1).
-        if len(segment1) >= 1:
-            boundary_pair = [input_frames[split_index - 1], input_frames[split_index]]
-            with tf.device('/GPU:0'):
-                interp_boundary = interpolator_lib.Interpolator(
-                    _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
-                boundary_frames = list(util.interpolate_recursively_from_files(
-                    boundary_pair, times, interp_boundary, gpu_info='/GPU:0'))
-        else:
-            boundary_frames = []
-
-        # Merge the results:
-        # results[0] already ends with input_frames[split_index-1] and results[1] begins with input_frames[split_index].
-        # We compute the boundary interpolation and remove its first and last frames (which duplicate the boundary).
-        if len(segment1) >= 1 and boundary_frames:
-            boundary_mid = boundary_frames[1:-1]
-            seg1_tail = results[1][1:]  # Drop the first frame from GPU1's segment.
-            combined_frames = results[0] + boundary_mid + seg1_tail
+        # Merge results: drop the first frame from GPU1's result to avoid duplication.
+        if results[1]:
+            combined_frames = results[0] + results[1][1:]
         else:
             combined_frames = results[0]
 
-    # Write the combined frames to a folder.
+    # Save all frames into an output directory.
     output_dir = os.path.join(directory, "interpolated_frames")
-    util._output_frames(combined_frames, output_dir)
+    util.output_frames(combined_frames, output_dir)
     # Zip the output frames.
     zip_path = os.path.join(directory, "interpolated_frames.zip")
     if os.path.exists(zip_path):
@@ -146,7 +125,7 @@ def _process_directory(directory: str):
     logging.info('Interpolated frames have been zipped at %s.', zip_path)
 
 def main(argv: Sequence[str]) -> None:
-    del argv
+    del argv  # Unused.
     directories = tf.io.gfile.glob(_PATTERN.value)
     if not directories:
         logging.error('No directories found matching pattern %s', _PATTERN.value)
