@@ -2,18 +2,19 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ['PYTHONWARNINGS'] = 'ignore'
 import shutil
-from typing import Generator, Iterable, List, Optional
+from typing import Generator, Iterable, List
 
 from . import interpolator as interpolator_lib
 import numpy as np
 import tensorflow as tf
 import logging
 from tqdm.auto import tqdm
+from tqdm.contrib.logging import TqdmLoggingHandler
 
-# Set up logger.
+# Set up logger with tqdm logging handler.
 logger = logging.getLogger("frame_interpolation.util")
 if not logger.handlers:
-    handler = logging.StreamHandler()
+    handler = TqdmLoggingHandler()
     formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -53,9 +54,10 @@ def _recursive_generator(
     interpolator: interpolator_lib.Interpolator,
     total: int,
     progress: dict,
-    gpu_info: str
+    gpu_info: str,
+    pbar=None
 ) -> Generator[np.ndarray, None, None]:
-    """Recursively interpolates between two frames."""
+    """Recursively interpolates between two frames, updating the shared progress bar."""
     if num_recursions == 0:
         yield frame1
     else:
@@ -66,24 +68,28 @@ def _recursive_generator(
             time
         )[0]
         progress["count"] += 1
-        # Update progress using tqdm's write (prints without interfering with the bar).
-        tqdm.write(f"GPU {gpu_info}: Processed {progress['count']}/{total} interpolation steps")
+        if pbar is not None:
+            pbar.update(1)
+        else:
+            tqdm.write(f"GPU {gpu_info}: Processed {progress['count']}/{total} interpolation steps")
         yield from _recursive_generator(frame1, mid_frame, num_recursions - 1,
-                                        interpolator, total, progress, gpu_info)
+                                        interpolator, total, progress, gpu_info, pbar)
         yield from _recursive_generator(mid_frame, frame2, num_recursions - 1,
-                                        interpolator, total, progress, gpu_info)
+                                        interpolator, total, progress, gpu_info, pbar)
 
-def interpolate_recursively_from_files(
+def _recursive_generator_chain(
     frames: List[str],
     times_to_interpolate: int,
-    interpolator: interpolator_lib.Interpolator
-) -> Iterable[np.ndarray]:
-    """Generates interpolated frames from file paths."""
+    interpolator: interpolator_lib.Interpolator,
+    total: int,
+    progress: dict,
+    pbar
+) -> Generator[np.ndarray, None, None]:
+    """
+    Processes a list of frame file paths sequentially,
+    using a shared progress bar.
+    """
     n = len(frames)
-    total = (n - 1) * (2**times_to_interpolate - 1)
-    device = get_valid_device()
-    logger.info("Starting recursive interpolation on %s with total steps: %d", device, total)
-    progress = {"count": 0}
     for i in range(1, n):
         yield from _recursive_generator(
             read_image(frames[i - 1]),
@@ -92,37 +98,31 @@ def interpolate_recursively_from_files(
             interpolator,
             total,
             progress,
-            device
+            get_valid_device(),
+            pbar
         )
     yield read_image(frames[-1])
 
-def interpolate_recursively_from_memory(
-    frames: List[np.ndarray],
+def interpolate_recursively_from_files(
+    frames: List[str],
     times_to_interpolate: int,
     interpolator: interpolator_lib.Interpolator
 ) -> Iterable[np.ndarray]:
-    """Generates interpolated frames from in-memory images."""
+    """Generates interpolated frames from file paths with a graphical progress bar."""
     n = len(frames)
-    total = (n - 1) * (2**times_to_interpolate - 1)
+    total = (n - 1) * (2 ** times_to_interpolate - 1)
     device = get_valid_device()
     logger.info("Starting recursive interpolation on %s with total steps: %d", device, total)
     progress = {"count": 0}
-    for i in range(1, n):
-        yield from _recursive_generator(
-            frames[i - 1],
-            frames[i],
-            times_to_interpolate,
-            interpolator,
-            total,
-            progress,
-            device
-        )
-    yield frames[-1]
-
-def get_ffmpeg_path() -> str:
-    path = shutil.which(_CONFIG_FFMPEG_NAME_OR_PATH)
-    if not path:
-        raise RuntimeError(
-            f"Program '{_CONFIG_FFMPEG_NAME_OR_PATH}' not found; please install ffmpeg."
-        )
-    return path
+    with tqdm(total=total, desc="Interpolation progress", ncols=100) as pbar:
+        for i in range(1, n):
+            yield from _recursive_generator(
+                read_image(frames[i - 1]),
+                read_image(frames[i]),
+                times_to_interpolate,
+                interpolator,
+                total,
+                progress,
+                device,
+                pbar=pbar
+            )
