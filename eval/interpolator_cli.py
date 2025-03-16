@@ -11,6 +11,7 @@ import natsort
 import numpy as np
 import tensorflow as tf
 from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 # Set TensorFlow log level.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -89,14 +90,12 @@ def _process_directory(directory: str):
 
     if num_gpus >= 2:
         # For multi-GPU, split the input frames into two segments.
-        # (Note: to process every adjacent pair, the segments must overlap by one frame.)
-        # For even input counts, one segment will have one more frame than the other.
         if num_input_frames % 2 == 0:
-            segment1 = input_frames[: num_input_frames//2 + 1]
-            segment2 = input_frames[num_input_frames//2:]
+            segment1 = input_frames[: num_input_frames // 2 + 1]
+            segment2 = input_frames[num_input_frames // 2:]
         else:
-            segment1 = input_frames[: (num_input_frames//2) + 1]
-            segment2 = input_frames[(num_input_frames//2):]
+            segment1 = input_frames[: (num_input_frames // 2) + 1]
+            segment2 = input_frames[(num_input_frames // 2):]
         logging.info("Total %d frames split as follows: Segment 1: %d frames, Segment 2: %d frames.",
                      num_input_frames, len(segment1), len(segment2))
         segments = [segment1, segment2]
@@ -114,20 +113,22 @@ def _process_directory(directory: str):
                     _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
                 # Calculate total interpolation steps for this segment.
                 num_pairs = len(seg_frames) - 1
-                total_steps = num_pairs * (2**times - 1)
+                total_steps = num_pairs * (2 ** times - 1)
                 progress = {"count": 0}
                 seg_result = []
                 # Process each adjacent pair.
-                for i in range(1, len(seg_frames)):
-                    # _recursive_generator is used to compute interpolated frames for a pair.
-                    pair_frames = list(util._recursive_generator(
-                        util.read_image(seg_frames[i - 1]),
-                        util.read_image(seg_frames[i]),
-                        times, interpolator, total_steps, progress, device_str))
-                    # Append all but the last frame to avoid duplicate at boundaries.
-                    seg_result.extend(pair_frames[:-1])
-                # Append the final frame of the segment.
-                seg_result.append(util.read_image(seg_frames[-1]))
+                # Create a shared progress bar for this segment.
+                with tqdm(total=total_steps, desc=f"GPU {gpu_index} Interpolation", ncols=100) as pbar:
+                    for i in range(1, len(seg_frames)):
+                        pair_frames = list(util._recursive_generator(
+                            util.read_image(seg_frames[i - 1]),
+                            util.read_image(seg_frames[i]),
+                            times, interpolator, total_steps, progress, device_str,
+                            pbar=pbar))
+                        # Append all but the last frame to avoid duplicate at boundaries.
+                        seg_result.extend(pair_frames[:-1])
+                    # Append the final frame of the segment.
+                    seg_result.append(util.read_image(seg_frames[-1]))
             results[gpu_index] = seg_result
             logging.info("GPU %d finished processing frames %s through %s", gpu_index, first_frame, last_frame)
 
@@ -145,7 +146,15 @@ def _process_directory(directory: str):
         with tf.device('/GPU:0' if num_gpus == 1 else '/CPU:0'):
             interpolator = interpolator_lib.Interpolator(
                 _MODEL_PATH.value, _ALIGN.value, [_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
-            combined_frames = list(util.interpolate_recursively_from_files(input_frames, times, interpolator))
+            # Calculate total steps for progress bar.
+            num_pairs = len(input_frames) - 1
+            total_steps = num_pairs * (2 ** times - 1)
+            progress = {"count": 0}
+            # Create a shared progress bar.
+            pbar = tqdm(total=total_steps, desc="Interpolation progress", ncols=100)
+            combined_frames = list(util._recursive_generator_chain(
+                input_frames, times, interpolator, total_steps, progress, pbar))
+            pbar.close()
 
     # Save output frames.
     output_dir = os.path.join(directory, "interpolated_frames")
@@ -159,12 +168,14 @@ def _process_directory(directory: str):
 
 def main(argv: Sequence[str]) -> None:
     del argv
-    directories = tf.io.gfile.glob(_PATTERN.value)
-    if not directories:
-        logging.error('No directories found matching pattern %s', _PATTERN.value)
-        return
-    for directory in directories:
-        _process_directory(directory)
+    # Redirect logging so that tqdm progress bars remain intact.
+    with logging_redirect_tqdm():
+        directories = tf.io.gfile.glob(_PATTERN.value)
+        if not directories:
+            logging.error('No directories found matching pattern %s', _PATTERN.value)
+            return
+        for directory in directories:
+            _process_directory(directory)
 
 if __name__ == '__main__':
     app.run(main)
