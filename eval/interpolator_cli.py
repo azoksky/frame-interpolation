@@ -1,9 +1,9 @@
 """
 This script performs recursive frame interpolation on all directories matching the given pattern.
-It is designed to work on both single‐GPU and multi‐GPU systems with a unified graphical progress bar.
+It is designed to work on both single‑GPU and multi‑GPU systems with a unified graphical progress bar.
 It no longer creates videos automatically – only the interpolated frames are saved (and zipped).
 
-Usage (from command line):
+Usage:
     python3 -m eval.interpolator_cli \
       --pattern /kaggle/working/frames \
       --model_path /kaggle/frame-interpolation/pretrained_models/film_net/Style/saved_model \
@@ -24,7 +24,7 @@ from tqdm import tqdm
 import natsort
 import zipfile
 
-# Set TensorFlow log level (prints TF messages to stderr)
+# Set TensorFlow log level.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
 
 # Define command-line flags.
@@ -71,16 +71,18 @@ class Interpolator:
 
     def __call__(self, frame1: np.ndarray, frame2: np.ndarray, t: np.ndarray) -> np.ndarray:
         # The saved model expects a dict input with keys "x0", "x1", and "time".
-        # Here, frame1 and frame2 are expected to have shape (1, H, W, 3) and t shape (1, 1).
-        result = self.model({"x0": frame1, "x1": frame2, "time": t}, training=False)
-        # Return as a numpy array.
+        inputs = {"x0": frame1, "x1": frame2, "time": t}
+        result = self.model(inputs, training=False)
+        # Some models return a dict of outputs. In that case, extract the first value.
+        if isinstance(result, dict):
+            result = list(result.values())[0]
         return result.numpy()
 
 # -----------------------------------------------------------------------------
 # Image I/O functions
 # -----------------------------------------------------------------------------
 def read_image(filename: str) -> np.ndarray:
-    """Reads an image from file and returns a float32 RGB array with values in [0,1]."""
+    """Reads an image file and returns an RGB float32 array with values in [0,1]."""
     image_data = tf.io.read_file(filename)
     image = tf.io.decode_image(image_data, channels=3)
     image = tf.cast(image, tf.float32).numpy()
@@ -126,7 +128,7 @@ def interpolate_recursively_from_files(frames: List[str],
                                        gpu_info: str) -> Iterable[np.ndarray]:
     """
     Iterates over adjacent pairs of image file paths, interpolating between them recursively.
-    Yields all interpolated frames (including original input frames).
+    Yields all interpolated frames (including the original input frames).
     """
     n = len(frames)
     logging.info("Starting recursive interpolation on %s for %d adjacent pairs.", gpu_info, n - 1)
@@ -139,7 +141,7 @@ def interpolate_recursively_from_files(frames: List[str],
             global_bar,
             gpu_info
         )
-    # Yield the very last frame
+    # Yield the very last frame.
     yield read_image(frames[-1])
 
 # -----------------------------------------------------------------------------
@@ -162,10 +164,12 @@ def _process_directory(directory: str) -> None:
     """
     For a given directory, gathers input frames, performs interpolation (on one or two GPUs),
     writes the output frames to a subfolder, and creates a ZIP archive of the results.
-    The splitting for multi-GPU is done so that (if n is even) both GPUs process an equal number
-    of frames (with an overlapping region for continuity), and if n is odd, the split is nearly equal.
+    The multi‑GPU split is performed as follows:
+      - If the number of frames is even, GPU0 processes the first half plus one overlap, 
+        and GPU1 processes the second half.
+      - If odd, the first GPU processes one more frame.
     """
-    # Gather input frames (supporting png, jpg, jpeg)
+    # Gather input frames (png, jpg, jpeg)
     exts = ['png', 'jpg', 'jpeg']
     frames = []
     for ext in exts:
@@ -177,22 +181,18 @@ def _process_directory(directory: str) -> None:
     logging.info("Found %d input frames in %s.", len(frames), directory)
     times = _TIMES_TO_INTERPOLATE.value
 
-    # Calculate total expected interpolation calls (for a single GPU run):
+    # Total expected interpolation calls (for progress bar):
     total_expected = (len(frames) - 1) * (2 ** times - 1)
-    # Create a shared global progress bar.
     global_bar = tqdm(total=total_expected, desc="Total Progress", position=0)
 
-    # Determine available GPUs.
+    # Check available GPUs.
     physical_gpus = tf.config.list_physical_devices('GPU')
     num_gpus = len(physical_gpus)
     logging.info("Number of GPUs available: %d", num_gpus)
 
     if num_gpus > 1:
-        # Multi-GPU mode: split the input frames into two segments with overlap.
+        # Multi-GPU: split frames into two segments with one frame overlap.
         n = len(frames)
-        # For equal load with overlap, use:
-        #   Segment1: frames[0:mid+1]
-        #   Segment2: frames[mid-1:n]
         mid = n // 2 if n % 2 == 0 else (n // 2 + 1)
         segment1 = frames[:mid + 1]
         segment2 = frames[mid - 1:]
@@ -225,7 +225,7 @@ def _process_directory(directory: str) -> None:
             logging.error("One of the GPU workers failed.")
             return
 
-        # Merge results by taking full result from GPU0 and appending GPU1's result excluding its first frame.
+        # Merge results: take all of GPU0 and append GPU1 (dropping the first overlapping frame).
         combined_frames = results[0] + results[1][1:]
     else:
         # Single GPU (or CPU) scenario.
@@ -235,7 +235,7 @@ def _process_directory(directory: str) -> None:
                                                                        gpu_info="/GPU:0" if num_gpus == 1 else "CPU"))
         global_bar.close()
 
-    # Save output frames to a subdirectory.
+    # Save output frames.
     output_dir = os.path.join(directory, "interpolated")
     _output_frames(combined_frames, output_dir)
 
