@@ -73,10 +73,16 @@ class Interpolator:
         # The saved model expects a dict input with keys "x0", "x1", and "time".
         inputs = {"x0": frame1, "x1": frame2, "time": t}
         result = self.model(inputs, training=False)
-        # Some models return a dict of outputs. In that case, extract the first value.
+        # If the result is a dict, take the first value.
         if isinstance(result, dict):
             result = list(result.values())[0]
-        return result.numpy()
+        # If the result is a list, take its first element.
+        elif isinstance(result, list):
+            result = result[0]
+        # If the result is a tensor, return its numpy value.
+        if hasattr(result, "numpy"):
+            return result.numpy()
+        return result
 
 # -----------------------------------------------------------------------------
 # Image I/O functions
@@ -99,7 +105,7 @@ def write_image(filename: str, image: np.ndarray) -> None:
     tf.io.write_file(filename, encoded)
 
 # -----------------------------------------------------------------------------
-# Recursive interpolation functions with a global progress bar
+# Recursive interpolation functions with a unified progress bar
 # -----------------------------------------------------------------------------
 def _recursive_generator(frame1: np.ndarray,
                          frame2: np.ndarray,
@@ -165,9 +171,9 @@ def _process_directory(directory: str) -> None:
     For a given directory, gathers input frames, performs interpolation (on one or two GPUs),
     writes the output frames to a subfolder, and creates a ZIP archive of the results.
     The multi‑GPU split is performed as follows:
-      - If the number of frames is even, GPU0 processes the first half plus one overlap, 
+      - For an even number of frames, GPU0 processes the first half (with one overlapping frame)
         and GPU1 processes the second half.
-      - If odd, the first GPU processes one more frame.
+      - For an odd number, GPU0 processes one more frame than GPU1.
     """
     # Gather input frames (png, jpg, jpeg)
     exts = ['png', 'jpg', 'jpeg']
@@ -181,7 +187,7 @@ def _process_directory(directory: str) -> None:
     logging.info("Found %d input frames in %s.", len(frames), directory)
     times = _TIMES_TO_INTERPOLATE.value
 
-    # Total expected interpolation calls (for progress bar):
+    # Total expected interpolation calls (for progress bar)
     total_expected = (len(frames) - 1) * (2 ** times - 1)
     global_bar = tqdm(total=total_expected, desc="Total Progress", position=0)
 
